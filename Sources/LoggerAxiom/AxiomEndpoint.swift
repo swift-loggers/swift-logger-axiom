@@ -6,7 +6,7 @@ import Foundation
 /// `AxiomEndpoint` has two cases that correspond to two distinct
 /// deployment shapes; pick the one that matches your trust model.
 ///
-/// ## ``AxiomEndpoint/axiom(url:token:)``
+/// ## Direct delivery — `.axiom(url:token:)`
 ///
 /// Direct delivery to Axiom's HTTP ingest API. The adapter POSTs the
 /// JSON array request body to `url` **verbatim** -- it does not
@@ -31,7 +31,7 @@ import Foundation
 /// another intermediary you control), so the real Axiom API token
 /// never ships with the client.
 ///
-/// ## ``AxiomEndpoint/intake(url:authorizationHeader:)``
+/// ## Consumer-owned intake / proxy — `.intake(url:authorizationHeader:)`
 ///
 /// Delivery through a first-party intake / proxy / gateway endpoint
 /// owned by the consumer. The adapter POSTs the JSON array request
