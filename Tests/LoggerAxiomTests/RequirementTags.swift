@@ -100,8 +100,8 @@ extension Tag {
     /// `flush()` drains every accepted pending entry before calling
     /// the engine flush closure.
     @Tag public static var axm25: Self
-    /// Per-caller serial ordering preserved in the worker's
-    /// enqueue order.
+    /// Per-caller serial admission ordering is preserved in the
+    /// worker's enqueue order.
     @Tag public static var axm26: Self
     /// Concurrent admissions never produce duplicate identifiers.
     @Tag public static var axm27: Self
@@ -121,7 +121,8 @@ extension Tag {
     /// `attributes` object.
     @Tag public static var axm31: Self
     /// Encoded event payload bytes are framed verbatim by the
-    /// existing Axiom request body helper.
+    /// existing Axiom request body helper without additional
+    /// logger-side metadata envelope or wrapping.
     @Tag public static var axm32: Self
     /// Threshold uses the nested `AxiomLogger.MinimumLevel` enum
     /// (seven severities); `LoggerLevel.disabled` is not
@@ -133,4 +134,51 @@ extension Tag {
     /// and surface
     /// `AxiomLoggerDiagnostic.admissionSequenceExhausted`.
     @Tag public static var axm34: Self
+
+    // MARK: `AxiomLoggingService`
+
+    /// `start()` is idempotent: repeated calls launch a single
+    /// internal periodic loop.
+    @Tag public static var axm35: Self
+    /// `AxiomFlushPolicy.manual` starts no periodic loop; explicit
+    /// `flush()` and the final flush in `stop()` are the only
+    /// flushes the service drives.
+    @Tag public static var axm36: Self
+    /// `AxiomFlushPolicy.periodic(seconds:)` starts one internal
+    /// periodic loop that drives `AxiomLogger.flush()`.
+    @Tag public static var axm37: Self
+    /// Periodic flushes are serially scheduled in a single internal
+    /// task; the next sleep begins only after the previous flush
+    /// returns. No two periodic flushes overlap.
+    @Tag public static var axm38: Self
+    /// `AxiomLoggingService.flush()` forwards to `AxiomLogger.flush()`
+    /// and returns its `RemoteFlushSummary` or rethrows the
+    /// underlying error.
+    @Tag public static var axm39: Self
+    /// `AxiomLoggingService.stop()` cancels the periodic loop,
+    /// awaits its exit, and performs exactly one final
+    /// `AxiomLogger.flush()` before returning. Subsequent calls are
+    /// no-ops.
+    @Tag public static var axm40: Self
+    /// A throw from the periodic flush surfaces
+    /// `AxiomLoggingServiceDiagnostic.flushFailed(_:)`; the periodic
+    /// loop continues.
+    @Tag public static var axm41: Self
+    /// A throw from the final flush inside `stop()` surfaces
+    /// `AxiomLoggingServiceDiagnostic.flushFailed(_:)` instead of
+    /// re-throwing.
+    @Tag public static var axm42: Self
+    /// `AxiomLoggingService` introduces no UIKit / AppKit / SwiftUI /
+    /// WatchKit dependency.
+    @Tag public static var axm43: Self
+    /// `.periodic(seconds:)` with a non-positive, non-finite, or
+    /// sub-nanosecond interval starts no periodic loop and
+    /// surfaces
+    /// `AxiomLoggingServiceDiagnostic.invalidFlushInterval(seconds:)`;
+    /// the service behaves as `.manual` thereafter.
+    @Tag public static var axm44: Self
+    /// Deallocating an `AxiomLoggingService` cancels its periodic
+    /// loop; cancellation prevents any further iteration but does
+    /// not abort an in-flight flush.
+    @Tag public static var axm45: Self
 }

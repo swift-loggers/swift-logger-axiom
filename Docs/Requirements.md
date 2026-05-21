@@ -5,13 +5,19 @@ This document locks the requirement IDs (`AXM-*`) that
 mapped to its enforcing test in
 [`Tests/LoggerAxiomTests/CoverageMap.md`](../Tests/LoggerAxiomTests/CoverageMap.md).
 
-`AXM-1` through `AXM-15` were locked in `0.1.0` and describe the
+`AXM-1` through `AXM-15` shipped in `0.1.0` and describe the
 durable Axiom HTTP ingest path (`AxiomRemoteEngine` factory, the
 `RemoteTransport.sendBatch(_:)` contract, classification, the
 endpoint trust model, and the engine-lifecycle ownership rules).
-`AXM-16` through `AXM-34` are added in `0.2.0` and describe the new
+`AXM-16` through `AXM-34` ship in `0.2.0` and describe the new
 `AxiomLogger` admission, worker, default encoder, transport framing,
 threshold-enum, and admission-sequence-exhaustion contracts.
+`AXM-35` through `AXM-45` ship in `0.2.0` and describe the new
+`AxiomLoggingService` flush coordinator (lifecycle idempotency,
+policy semantics, non-overlapping periodic cadence, explicit flush
+forwarding, stop-time final flush, diagnostic surface, platform
+independence, invalid-interval rejection, and periodic-loop
+cancellation on deallocation).
 
 ## Payload contract
 
@@ -120,11 +126,16 @@ verbatim.
 
 ### `AXM-13` Caller-driven flush lifecycle
 
-The package installs no autonomous scheduler, no platform
-lifecycle observer, and no timer. `RemoteEngine.flush()` is
-caller-driven; hosts wire `flush()` from their own lifecycle
-hooks or scheduling infrastructure (background notifications,
-shutdown signals, periodic tasks).
+`RemoteEngine.flush()` and ``AxiomLogger/flush()`` are
+caller-driven; neither installs an autonomous scheduler,
+platform lifecycle observer, or timer. Hosts wire `flush()`
+from their own lifecycle hooks or scheduling infrastructure
+(background notifications, shutdown signals, periodic tasks).
+Periodic scheduling is available as an explicit opt-in through
+``AxiomLoggingService`` (`AXM-35..45`); the service runs a
+timer only after the host calls ``AxiomLoggingService/start()``
+and subscribes to no process-lifecycle notification on its
+own.
 
 ### `AXM-14` Retained outstanding batch reuse
 
@@ -325,22 +336,124 @@ the diagnostic again. The condition is a hard stop on that
 instance and does not propagate to other loggers or to the
 engine's durable-delivery lifecycle.
 
+## `AxiomLoggingService`
+
+### `AXM-35` Start idempotency
+
+``AxiomLoggingService/start()`` is idempotent. Repeated calls do
+not launch additional internal periodic loops. A call after
+``AxiomLoggingService/stop()`` is a no-op.
+
+### `AXM-36` Manual policy has no periodic loop
+
+Under ``AxiomFlushPolicy/manual``, ``AxiomLoggingService/start()``
+starts no periodic task. The only flushes the service drives are
+explicit ``AxiomLoggingService/flush()`` calls and the single
+final flush performed inside ``AxiomLoggingService/stop()``.
+
+### `AXM-37` Periodic policy drives flushes
+
+Under ``AxiomFlushPolicy/periodic(seconds:)`` with a finite,
+positive interval, ``AxiomLoggingService/start()`` launches one
+internal task that sleeps for the configured interval and then
+drives one ``AxiomLogger/flush()`` per tick.
+
+### `AXM-38` Periodic flushes are serial
+
+The periodic loop awaits each ``AxiomLogger/flush()`` to
+completion before starting the next sleep. Two periodic flushes
+on the same service instance never overlap. The service runs at
+most one periodic task per instance.
+
+### `AXM-39` Explicit flush forwards
+
+``AxiomLoggingService/flush()`` forwards directly to
+``AxiomLogger/flush()`` and returns the resulting
+`RemoteFlushSummary`. A throw from the underlying flush is
+re-thrown to the caller verbatim; the diagnostic callback is not
+invoked for explicit-flush failures.
+
+### `AXM-40` Stop cancels and performs final flush
+
+``AxiomLoggingService/stop()`` cancels the periodic loop, awaits
+its exit, and performs exactly one final ``AxiomLogger/flush()``
+before returning. After any ``AxiomLoggingService/stop()`` call
+returns, no further periodic flush fires and the final flush has
+completed. Concurrent or subsequent ``AxiomLoggingService/stop()``
+calls join the in-flight stop and return only after that stop
+work completes; the final flush runs exactly once per service
+instance.
+
+### `AXM-41` Periodic failure surfaces diagnostic
+
+A throw from a periodic ``AxiomLogger/flush()`` surfaces
+``AxiomLoggingServiceDiagnostic/flushFailed(_:)`` via the
+`onDiagnostic` callback with `String(describing: error)`. The
+periodic loop continues running and the next sleep starts as
+usual.
+
+### `AXM-42` Stop-time final flush failure surfaces diagnostic
+
+A throw from the final ``AxiomLogger/flush()`` inside
+``AxiomLoggingService/stop()`` surfaces
+``AxiomLoggingServiceDiagnostic/flushFailed(_:)`` via the
+`onDiagnostic` callback instead of re-throwing from
+``AxiomLoggingService/stop()``.
+
+### `AXM-43` Platform independence
+
+``AxiomLoggingService`` and its supporting types
+(``AxiomFlushPolicy``, ``AxiomLoggingServiceDiagnostic``) declare
+no UIKit / AppKit / SwiftUI / WatchKit imports. The service does
+not subscribe to any process-lifecycle notification on its own;
+integration with platform lifecycle callbacks is the caller's
+responsibility.
+
+### `AXM-44` Invalid periodic interval rejected without hot loop
+
+``AxiomLoggingService/start()`` called with
+``AxiomFlushPolicy/periodic(seconds:)`` where `seconds` is
+non-positive, non-finite, or so small that it truncates to zero
+nanoseconds does not launch a periodic loop. The service marks
+itself as started, surfaces
+``AxiomLoggingServiceDiagnostic/invalidFlushInterval(seconds:)``
+through the `onDiagnostic` callback with the offending value, and
+behaves as ``AxiomFlushPolicy/manual`` thereafter. The final flush
+inside ``AxiomLoggingService/stop()`` still runs as for any other
+policy.
+
+### `AXM-45` Periodic loop cancelled on deallocation
+
+Deallocating an ``AxiomLoggingService`` cancels its periodic
+loop. Cancellation interrupts the loop's next `Task.sleep` and
+prevents any further iteration; any flush already in flight
+when deallocation runs completes on its own and is not aborted.
+``AxiomLoggingService/stop()`` remains the only path that
+initiates a final ``AxiomLogger/flush()``; deallocation alone
+does not initiate a flush.
+
 ## Non-goals
 
 `swift-logger-axiom 0.2.0` deliberately ships no:
 
-- autonomous scheduler or timer; ``AxiomLogger/flush()`` is
-  caller-driven.
-- platform lifecycle observer.
+- autonomous scheduler on the durable delivery surface:
+  ``AxiomLogger/flush()`` is caller-driven, and the optional
+  ``AxiomLoggingService`` periodic loop runs only when the host
+  calls ``AxiomLoggingService/start()`` under
+  ``AxiomFlushPolicy/periodic(seconds:)``.
+- platform lifecycle observer. ``AxiomLoggingService`` does not
+  subscribe to any process-lifecycle notification on its own.
 - SDK / RUM integration (HTTP-only -- Axiom does not ship a
   first-party iOS SDK).
 - per-item parsing of Axiom's `failures` response array; whole-
   batch 2xx -> success projection remains the transport contract.
 - query / search API.
 - direct mobile-safe token claims.
-- transport metadata on the `RemoteDeliveryEntry`; the `0.2.0`
-  encoder writes payload bytes only. Hosts that need routing hints
-  should encode them as ordinary JSON fields in the event document
-  or use an intake / proxy endpoint.
+- transport metadata on the `RemoteDeliveryEntry`; the
+  [`AXM-32`](#axm-32-encoded-payload-framed-verbatim-by-the-transport)
+  payload / framing contract keeps encoded payload bytes verbatim, and
+  the default `0.2.0` encoder writes payload bytes only. Hosts that need
+  routing hints should encode them as ordinary JSON fields in the event
+  document or use an intake / proxy endpoint.
 - in-logger retry of encoder, identifier, or enqueue failures.
   Diagnostics are surfaced; the entry is dropped.

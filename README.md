@@ -44,6 +44,11 @@ periodic tasks).
 >   buffer-policy and minimum-level controls, and an
 >   `onDiagnostic` callback. `flush()` drains accepted pending
 >   entries and runs the engine flush pass.
+> - `AxiomLoggingService`: optional flush coordinator over an
+>   `AxiomLogger`. `AxiomFlushPolicy` selects `.manual` or
+>   `.periodic(seconds:)` cadence; `AxiomLoggingServiceDiagnostic`
+>   surfaces `flushFailed(String)` and
+>   `invalidFlushInterval(seconds:)`.
 
 Requires Swift 6.0+. iOS 13.4, macOS 10.15.4, tvOS 13.4,
 watchOS 6.2, visionOS 1. MIT licensed.
@@ -400,14 +405,58 @@ deduplication identity across app launches can supply their own
 `AxiomIdentifierProvider`. `AxiomMonotonicIdentifierProvider` is
 process-local and does not guarantee stable IDs across app restarts.
 
+## `AxiomLoggingService`
+
+`AxiomLoggingService` is an optional convenience over explicit
+`AxiomLogger.flush()`. It owns scheduling (periodic flushes plus a
+final flush at shutdown); the logger stays deterministic. The
+service has no UIKit / AppKit / SwiftUI dependency and subscribes
+to no process-lifecycle notification on its own — wire `start()`
+and `stop()` from whatever lifecycle hooks the host already
+manages.
+
+```swift
+let logger = AxiomLogger(wiring: wiring)
+let service = AxiomLoggingService(logger: logger)
+service.start()
+```
+
+The default `flushPolicy` is `.periodic(seconds: 30)`. Use
+`.manual` to opt out of the periodic loop entirely and drive every
+flush explicitly:
+
+```swift
+let manualService = AxiomLoggingService(
+    logger: logger,
+    flushPolicy: .manual,
+    onDiagnostic: { diagnostic in
+        // periodic + stop-time flush failures arrive here
+        print("axiom service diagnostic: \(diagnostic)")
+    }
+)
+manualService.start()  // no-op under `.manual`
+_ = try await manualService.flush()  // explicit
+await manualService.stop()  // also performs one final flush
+```
+
+`start()` is idempotent. `stop()` cancels the periodic loop,
+awaits its exit, and performs exactly one final
+`AxiomLogger.flush()` before returning. A throw from that final
+flush — or from any periodic flush — surfaces through
+`onDiagnostic` as `AxiomLoggingServiceDiagnostic.flushFailed(_:)`
+instead of propagating. Explicit `service.flush()` calls re-throw
+the underlying error verbatim.
+
 ## Response model
 
 Axiom's ingest endpoint returns a **whole-request** status code
 and a single `{"ingested": N, "failed": M, "failures": [...]}`-
 shaped envelope. The adapter performs transport-level
 success/failure classification only and treats the response body as
-opaque payload bytes. It does **not** semantically parse or validate
-the response body for per-item classification, so:
+opaque payload bytes. Even on 2xx, the adapter does not compare
+`ingested` / `failed` counts against the dispatched batch size. It
+does **not** semantically parse or validate the response body for
+per-item classification, so:
 
 - A 2xx Axiom reply resolves every active item in the batch round
   to `.success` with the opaque response bytes Axiom returned.
@@ -424,10 +473,15 @@ the response body for per-item classification, so:
 
 `swift-logger-axiom 0.2.0` deliberately ships no:
 
-- autonomous scheduler. `RemoteEngine.flush()` and
-  `AxiomLogger.flush()` are caller-driven; host code wires both
-  from whatever lifecycle hooks it cares about.
-- platform lifecycle observer.
+- autonomous scheduler on the durable delivery surface.
+  `RemoteEngine.flush()` and `AxiomLogger.flush()` are
+  caller-driven; host code wires them from whatever lifecycle
+  hooks it cares about. `AxiomLoggingService` is the explicit
+  opt-in periodic-flush coordinator and does not run unless the
+  host calls `start()`.
+- platform lifecycle observer. `AxiomLoggingService` runs a
+  timer when opted into `.periodic(seconds:)` but subscribes to
+  no process-lifecycle notification on its own.
 - SDK / RUM integration. `swift-logger-axiom` is HTTP-only; Axiom
   does not ship a first-party iOS SDK.
 - per-item parsing of Axiom's `failures` response array. The
