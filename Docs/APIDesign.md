@@ -1,8 +1,10 @@
-# API design -- `swift-logger-axiom 0.1.0`
+# API design -- `swift-logger-axiom 0.2.0`
 
-`swift-logger-axiom` is a durable-only Axiom HTTP ingest adapter
-that bridges Axiom delivery onto `swift-logger-remote`'s
-`RemoteEngine` + `DurableRemoteQueue` engine surface.
+`swift-logger-axiom` is an Axiom HTTP ingest adapter that bridges
+Axiom delivery onto `swift-logger-remote`'s `RemoteEngine` +
+`DurableRemoteQueue` engine surface, plus a batteries-included
+`Loggers.Logger` adapter (`AxiomLogger`) that admits log entries
+non-blockingly and routes them through that engine.
 
 ## Public surface
 
@@ -29,13 +31,229 @@ public enum AxiomRemoteEngine {
 
     public static func make(_ configuration: Configuration) -> Wiring
 }
+
+public struct AxiomLogger: Loggers.Logger {
+    public enum MinimumLevel: String, CaseIterable, Sendable {
+        case trace, debug, info, notice, warning, error, critical
+    }
+
+    public init(
+        wiring: AxiomRemoteEngine.Wiring,
+        encoder: any AxiomLogEventEncoder = AxiomDefaultLogEventEncoder(),
+        identifierProvider: any AxiomIdentifierProvider = AxiomMonotonicIdentifierProvider(),
+        bufferPolicy: AxiomLoggerBufferPolicy = .dropNewest(capacity: 1_000),
+        minimumLevel: MinimumLevel = .trace,
+        onDiagnostic: (@Sendable (AxiomLoggerDiagnostic) -> Void)? = nil
+    )
+
+    public func log(
+        _ level: LoggerLevel,
+        _ domain: LoggerDomain,
+        _ message: @autoclosure @escaping @Sendable () -> LogMessage,
+        attributes: @autoclosure @escaping @Sendable () -> [LogAttribute]
+    )
+
+    public func flush() async throws -> RemoteFlushSummary
+}
+
+public struct AxiomLogEvent: Sendable, Equatable {
+    public let timestamp: Date
+    public let level: LoggerLevel
+    public let domain: LoggerDomain
+    public let message: LogMessage
+    public let attributes: [LogAttribute]
+}
+
+public protocol AxiomLogEventEncoder: Sendable {
+    func encode(_ event: AxiomLogEvent) throws -> Data
+}
+
+public struct AxiomDefaultLogEventEncoder: AxiomLogEventEncoder { ... }
+
+public protocol AxiomIdentifierProvider: Sendable {
+    func nextIdentifier() throws -> UInt64
+}
+
+public struct AxiomMonotonicIdentifierProvider: AxiomIdentifierProvider { ... }
+
+public enum AxiomMonotonicIdentifierError: Error, Sendable, Equatable {
+    case exhausted
+}
+
+public enum AxiomLoggerBufferPolicy: Sendable, Equatable {
+    case dropNewest(capacity: Int)
+    case dropOldest(capacity: Int)
+}
+
+public enum AxiomLoggerDiagnostic: Sendable, Equatable {
+    case bufferFull(dropped: Int)
+    case encodingFailed(String)
+    case identifierFailed(String)
+    case enqueueFailed(String)
+    case admissionSequenceExhausted
+}
 ```
 
 The package exposes **nothing else** as `public`. The internal
 `AxiomRemoteTransport`, `AxiomIngestTransport`,
 `URLSessionAxiomIngestTransport`, `AxiomIngestTransportError`,
-and `AxiomIngestRequestBody` types are package-internal and not
-part of the API surface.
+`AxiomIngestRequestBody`, and `AxiomLoggerStorage` types are
+package-internal and not part of the API surface.
+
+## AxiomLogger admission and worker
+
+`AxiomLogger` is a lightweight sendable logger handle backed by
+shared reference storage. The storage owns the bounded admission
+buffer, the admission sequence counter, the flush barriers, the
+diagnostic callback, and a single internal serial worker. Producers
+admit entries through the synchronous
+``AxiomLogger/log(_:_:_:attributes:)`` method; the internal worker
+materializes each accepted entry, allocates its identifier, encodes
+it, and hands the resulting payload bytes to
+``DurableRemoteQueue/enqueue(_:)`` in admission order. The worker is
+implementation-private and not actor-isolated API surface.
+
+### Drop guards
+
+Two drop guards run at the call site, **before** any closure is
+evaluated:
+
+- Entries tagged `LoggerLevel.disabled` are rejected
+  unconditionally.
+- Entries whose level is below `minimumLevel` are rejected.
+
+`minimumLevel` is typed as ``AxiomLogger/MinimumLevel`` (a
+`CaseIterable`, `Sendable` enum with exactly seven cases — the seven
+`Loggers.LoggerLevel` severities). The cross-adapter contract
+documented in the ecosystem roadmap forbids `LoggerLevel.disabled`
+as a threshold; the nested enum enforces that statically at the
+API surface so a caller cannot mistakenly drop every entry.
+
+A third drop guard applies under
+``AxiomLoggerBufferPolicy/dropNewest(capacity:)`` when the buffer
+is full: the new entry is rejected without evaluating its
+autoclosures. Under
+``AxiomLoggerBufferPolicy/dropOldest(capacity:)`` the oldest
+pending entry is evicted (also without evaluating it) and the new
+entry is admitted for later worker evaluation.
+
+### Worker pipeline
+
+For every accepted pending entry the worker:
+
+1. Calls the `message` autoclosure exactly once and the
+   `attributes` autoclosure exactly once.
+2. Builds an ``AxiomLogEvent`` carrying the admission-time
+   timestamp.
+3. Calls the configured ``AxiomLogEventEncoder``. A throw
+   surfaces ``AxiomLoggerDiagnostic/encodingFailed(_:)`` and the
+   entry is dropped.
+4. Calls the configured ``AxiomIdentifierProvider``. A throw
+   surfaces ``AxiomLoggerDiagnostic/identifierFailed(_:)`` and the
+   entry is dropped.
+5. Calls ``DurableRemoteQueue/enqueue(_:)``. A throw surfaces
+   ``AxiomLoggerDiagnostic/enqueueFailed(_:)``; the logger does
+   not locally retry the entry. The engine's own durable-delivery
+   lifecycle is unaffected by this diagnostic.
+
+### Flush barrier
+
+An accepted pending entry is a log entry successfully admitted into
+``AxiomLogger``'s internal buffer. ``AxiomLogger/flush()`` waits
+until every entry already admitted at the moment of the call has
+reached one of the terminal states above (enqueued or diagnostic
+failure), then runs ``RemoteEngine/flush()`` and forwards its
+``RemoteFlushSummary``. Entries dropped at admission are not part of
+the barrier because they were never accepted; entries admitted
+**after** `flush()` was invoked are also not part of the barrier
+(they form the next flush's drain target).
+
+### Identifier and ordering contract
+
+Per-caller serial ordering is preserved: a caller that emits
+entries A, B, C in order sees them reach the queue in the same
+order. No global ordering guarantee is made across concurrent
+callers. Identifiers are monotonic in worker dequeue order, not in
+wall-clock call order; under contention an entry admitted slightly
+later on one caller may receive an earlier identifier than one
+admitted slightly earlier on a different caller.
+
+The default ``AxiomMonotonicIdentifierProvider`` allocates
+process-local IDs that reset on every fresh process. Consumers
+that need persistent deduplication identity across launches must
+supply their own ``AxiomIdentifierProvider`` implementation.
+
+### Diagnostics
+
+The optional `onDiagnostic` callback receives ``AxiomLoggerDiagnostic``
+values. The invocation context is split by diagnostic kind:
+
+- ``AxiomLoggerDiagnostic/bufferFull(dropped:)`` and
+  ``AxiomLoggerDiagnostic/admissionSequenceExhausted`` fire
+  **synchronously on the caller's** ``AxiomLogger/log(_:_:_:attributes:)``
+  **path**. The buffer-policy decision (or the
+  `acceptedSequence == UInt64.max` exhaustion guard) is made under
+  the admission lock; the diagnostic is dispatched on the same
+  thread that called `log(...)` once the lock has been released.
+- ``AxiomLoggerDiagnostic/encodingFailed(_:)``,
+  ``AxiomLoggerDiagnostic/identifierFailed(_:)``, and
+  ``AxiomLoggerDiagnostic/enqueueFailed(_:)`` fire on the **internal
+  worker context** when the corresponding step throws while the
+  worker is materializing an accepted entry.
+
+The callback must satisfy the `@Sendable` contract in both cases.
+String payloads use `String(describing: error)`, not
+`localizedDescription`, so the diagnostic carries a stable spelling
+regardless of the upstream error's `LocalizedError` conformance.
+
+## Default JSON event schema
+
+``AxiomDefaultLogEventEncoder`` emits one JSON object per event:
+
+```json
+{
+  "_time": "2026-05-20T12:34:56.789Z",
+  "level": "info",
+  "domain": "Network",
+  "message": "Request finished",
+  "attributes": {
+    "status": 200,
+    "path": "/api/items",
+    "user_id": "<private>"
+  }
+}
+```
+
+Field contract:
+
+- `_time` -- RFC 3339 wall-clock string with fractional-second
+  precision (`yyyy-MM-ddTHH:mm:ss.SSSZ`), always in UTC.
+- `level` -- ``LoggerLevel/rawValue`` of the accepted entry.
+- `domain` -- ``LoggerDomain/rawValue`` of the accepted entry.
+- `message` -- ``LogMessage/redactedDescription`` (private
+  segments render as `<private>`, sensitive segments as
+  `<redacted>`).
+- `attributes` -- JSON object built from the entry's attributes.
+  Duplicate keys resolve last-wins. Private attribute values
+  render as the string `<private>`; sensitive values render as
+  `<redacted>`. ``LogValue`` cases map onto JSON primitives;
+  ``Date`` values use the same RFC 3339 spelling as `_time`;
+  non-finite `Double` values render through the stable fallback
+  path as `String(describing: value)`.
+
+The default encoder never throws for any
+``AxiomLogEvent`` constructable from a ``Loggers/Logger`` call;
+unsupported attribute values flow through the stable fallback
+path rather than failing the entry.
+
+## Transport framing
+
+The payload bytes ``AxiomLogger`` enqueues into
+``DurableRemoteQueue/enqueue(_:)`` are admitted as
+``RemoteDeliveryEntry/payload`` and framed by the internal
+``AxiomIngestRequestBody`` helper into the Axiom ingest JSON
+array `[<event_1>,<event_2>,...]` with no further interpretation,
+metadata wrapping, or transformation.
 
 ## Axiom endpoint trust model
 
@@ -113,11 +331,12 @@ Axiom's ingest endpoint returns a whole-request 2xx status when
 the request is accepted, with a response body of the shape
 `{"ingested": N, "failed": M, "failures": [...]}` carrying
 per-item success / failure counts and an optional `failures`
-array describing rejected items. `0.1.0` performs transport-level
-success/failure classification only and does **not** semantically
-parse or validate the response body for per-item classification,
-so a 2xx ingest reply resolves every input item to `.success`
-carrying the opaque response bytes Axiom returned.
+array describing rejected items. The adapter performs
+transport-level success/failure classification only and treats the
+response body as opaque payload bytes. It does **not** semantically
+parse or validate the response body for per-item classification, so a
+2xx ingest reply resolves every input item to `.success` carrying the
+opaque response bytes Axiom returned.
 
 ### Whole-request failure
 

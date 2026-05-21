@@ -20,6 +20,10 @@ let package = Package(
     ],
     dependencies: [
         .package(
+            url: "https://github.com/swift-loggers/swift-logger.git",
+            .upToNextMinor(from: "0.1.0")
+        ),
+        .package(
             url: "https://github.com/swift-loggers/swift-logger-remote.git",
             .upToNextMinor(from: "0.1.0")
         ),
@@ -29,6 +33,7 @@ let package = Package(
         .target(
             name: "LoggerAxiom",
             dependencies: [
+                .product(name: "Loggers", package: "swift-logger"),
                 .product(name: "LoggerRemote", package: "swift-logger-remote")
             ]
         ),
@@ -36,6 +41,7 @@ let package = Package(
             name: "LoggerAxiomTests",
             dependencies: [
                 "LoggerAxiom",
+                .product(name: "Loggers", package: "swift-logger"),
                 .product(name: "LoggerRemote", package: "swift-logger-remote")
             ],
             exclude: ["CoverageMap.md"]

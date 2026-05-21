@@ -1,9 +1,17 @@
-# Requirements -- `swift-logger-axiom 0.1.0`
+# Requirements -- `swift-logger-axiom 0.2.0`
 
 This document locks the requirement IDs (`AXM-*`) that
-`swift-logger-axiom 0.1.0` ships and tests against. Each ID is
+`swift-logger-axiom 0.2.0` ships and tests against. Each ID is
 mapped to its enforcing test in
 [`Tests/LoggerAxiomTests/CoverageMap.md`](../Tests/LoggerAxiomTests/CoverageMap.md).
+
+`AXM-1` through `AXM-15` were locked in `0.1.0` and describe the
+durable Axiom HTTP ingest path (`AxiomRemoteEngine` factory, the
+`RemoteTransport.sendBatch(_:)` contract, classification, the
+endpoint trust model, and the engine-lifecycle ownership rules).
+`AXM-16` through `AXM-34` are added in `0.2.0` and describe the new
+`AxiomLogger` admission, worker, default encoder, transport framing,
+threshold-enum, and admission-sequence-exhaustion contracts.
 
 ## Payload contract
 
@@ -54,10 +62,11 @@ indexer can correlate by position.
 Axiom's ingest endpoint returns a whole-request status for the
 current batch round; per-item failures appear in the response
 body's `failures` array but are intentionally **not** parsed by
-`0.1.0`. The adapter performs transport-level success/failure
-classification only and does not semantically parse or validate
-the response body, so a 2xx Axiom reply resolves every input item
-to `.success` carrying the opaque response bytes Axiom returned.
+this adapter. The adapter performs transport-level success/failure
+classification only and treats the response body as opaque payload
+bytes. It does not semantically parse or validate the response body,
+so a 2xx Axiom reply resolves every input item to `.success`
+carrying the opaque response bytes Axiom returned.
 
 ### `AXM-7` Whole-batch failure projection
 
@@ -134,16 +143,204 @@ only resolution still acknowledges (the classifier declared the
 entries permanently failed; removing those bytes is forward
 progress, not data loss).
 
+## `AxiomLogger` admission and worker
+
+### `AXM-16` `AxiomLogger(wiring:)` default-configurable
+
+`AxiomLogger(wiring:)` is constructable with the default
+``AxiomDefaultLogEventEncoder`` and the default
+``AxiomMonotonicIdentifierProvider``. An admitted entry flows
+through the worker, is eventually enqueued through
+``DurableRemoteQueue/enqueue(_:)``, and ``AxiomLogger/flush()``
+invokes the engine flush pass and returns the resulting
+``RemoteFlushSummary``.
+
+### `AXM-17` `LoggerLevel.disabled` drop never evaluates closures
+
+An entry tagged ``LoggerLevel/disabled`` is rejected at the call
+site without evaluating its `message` or `attributes` autoclosures.
+No internal buffer admission and no diagnostic callback fires for
+the rejection.
+
+### `AXM-18` Below-minimum drop never evaluates closures
+
+An entry whose level is below the configured `minimumLevel` is
+rejected at the call site without evaluating its `message` or
+`attributes` autoclosures. No internal buffer admission and no
+diagnostic callback fires for the rejection.
+
+`minimumLevel` is typed as ``AxiomLogger/MinimumLevel`` (the
+nested enum locked by `AXM-33`); `LoggerLevel.disabled` is not
+expressible as a threshold through the public API.
+
+### `AXM-19` Accepted entry evaluates closures exactly once
+
+For every accepted pending entry the internal worker evaluates the
+`message` autoclosure exactly once and the `attributes` autoclosure
+exactly once across the entry's lifetime. ``AxiomLogger`` itself
+performs no retries and never re-evaluates accepted closures.
+
+### `AXM-20` `.dropNewest` drops the new entry without evaluation
+
+When the bounded buffer is full and the policy is
+``AxiomLoggerBufferPolicy/dropNewest(capacity:)``, the new entry is
+rejected without evaluating its `message` or `attributes`
+autoclosures. The buffer is unchanged. The diagnostic callback
+fires ``AxiomLoggerDiagnostic/bufferFull(dropped:)`` with `dropped:
+1` per rejected admission.
+
+### `AXM-21` `.dropOldest` evicts the oldest pending entry
+
+When the bounded buffer is full and the policy is
+``AxiomLoggerBufferPolicy/dropOldest(capacity:)``, the oldest
+pending entry is evicted (without evaluating its `message` or
+`attributes` autoclosures) and the new entry is admitted for later
+worker evaluation. The diagnostic callback fires
+``AxiomLoggerDiagnostic/bufferFull(dropped:)`` with `dropped: 1`
+per evicted entry.
+
+### `AXM-22` Encoder failure surfaces `encodingFailed`
+
+When the configured ``AxiomLogEventEncoder`` throws while encoding
+an accepted entry, the worker drops the entry and surfaces
+``AxiomLoggerDiagnostic/encodingFailed(_:)`` with
+`String(describing: error)`. The failing entry is not enqueued.
+
+### `AXM-23` Identifier failure surfaces `identifierFailed`
+
+When the configured ``AxiomIdentifierProvider`` throws while
+allocating an identifier for an accepted entry, the worker drops
+the entry and surfaces
+``AxiomLoggerDiagnostic/identifierFailed(_:)`` with
+`String(describing: error)`. The failing entry is not enqueued.
+
+### `AXM-24` Enqueue failure surfaces `enqueueFailed`
+
+When ``DurableRemoteQueue/enqueue(_:)`` throws for an accepted
+entry after encoding and identifier allocation succeeded, the
+worker surfaces ``AxiomLoggerDiagnostic/enqueueFailed(_:)`` with
+`String(describing: error)`. The logger does not locally retry the
+entry; the engine's own durable-delivery lifecycle is unaffected by
+this diagnostic.
+
+### `AXM-25` Flush drains accepted pending before engine flush
+
+An accepted pending entry is a log entry successfully admitted into
+``AxiomLogger``'s internal buffer. ``AxiomLogger/flush()`` returns
+to the caller only after every entry already admitted at the moment
+of the call has either been enqueued onto the durable queue or
+surfaced a diagnostic failure (encoding, identifier allocation, or
+enqueue). After the drain barrier resolves, `flush()` invokes the
+engine flush closure and forwards its ``RemoteFlushSummary``.
+Entries admitted **after** `flush()` was invoked are not part of the
+barrier.
+
+### `AXM-26` Per-caller serial ordering preserved
+
+For a single caller that emits entries A, B, C in that order, the
+internal worker hands them to the enqueue closure in the same
+order. No global ordering guarantee is made across concurrent
+callers; identifiers are monotonic in worker dequeue order, not in
+wall-clock call order.
+
+### `AXM-27` Concurrent admissions have unique identifiers
+
+The default ``AxiomMonotonicIdentifierProvider`` returns a distinct
+`UInt64` for every accepted entry across concurrent admissions
+within a single process lifetime until `UInt64` exhaustion. Combined
+with the worker's serial allocation, every enqueued
+``RemoteDeliveryEntry`` carries a unique identifier.
+
+## Default encoder
+
+### `AXM-28` Documented JSON field names
+
+``AxiomDefaultLogEventEncoder`` emits one JSON object per event
+with the field names `_time`, `level`, `domain`, `message`, and
+`attributes`. `_time` is an RFC 3339 wall-clock string with
+fractional-second precision (`yyyy-MM-ddTHH:mm:ss.SSSZ`), always in
+UTC. Non-finite `Double` attribute values flow through the stable
+string fallback (`String(describing: value)`).
+
+### `AXM-29` Default encoder redacts message segment privacy
+
+Private message segments render as the literal string `<private>`
+and sensitive message segments render as `<redacted>`. Public
+segments render verbatim. The rendering is performed through
+``LogMessage/redactedDescription`` so the contract matches the
+core `Loggers` library's privacy degradation rule.
+
+### `AXM-30` Default encoder redacts attribute value privacy
+
+Private attribute values render as the literal string `<private>`
+and sensitive attribute values render as `<redacted>`. Public
+attribute values render through their JSON-native primitive
+spelling. The privacy annotation is consulted per attribute,
+independent of the message's privacy annotation.
+
+### `AXM-31` Duplicate attribute keys resolve last-wins
+
+When an entry carries multiple ``LogAttribute`` values that share
+the same key, the encoded `attributes` JSON object contains the
+value from the **last** occurrence in the call-site order.
+
+### `AXM-32` Encoded payload framed verbatim by the transport
+
+The payload bytes produced by ``AxiomDefaultLogEventEncoder`` are
+admitted into `DurableRemoteQueue.enqueue(_:)` as
+`RemoteDeliveryEntry.payload` and framed by the internal
+``AxiomIngestRequestBody`` helper into a JSON array
+`[<event_1>,<event_2>,...]` with no further interpretation,
+metadata wrapping, or transformation.
+
+### `AXM-33` Threshold uses nested `MinimumLevel` enum
+
+The public `minimumLevel` parameter of
+``AxiomLogger/init(wiring:encoder:identifierProvider:bufferPolicy:minimumLevel:onDiagnostic:)``
+is typed as ``AxiomLogger/MinimumLevel`` — a `CaseIterable`,
+`Sendable` enum with exactly seven cases (`.trace`, `.debug`,
+`.info`, `.notice`, `.warning`, `.error`, `.critical`). The
+ecosystem-wide cross-adapter rule forbids
+`LoggerLevel.disabled` as a threshold value; this enum enforces
+that statically at the API surface.
+
+### `AXM-34` Admission sequence exhaustion
+
+The internal admission-sequence allocator never wraps past
+`UInt64.max`. When the allocator has issued `UInt64.max`
+sequences and an additional admission is offered:
+
+- the new entry is rejected and the `acceptedSequence` counter
+  stays at `UInt64.max` (no wrap to `0`),
+- the entry's `message` and `attributes` autoclosures are not
+  evaluated,
+- no pending entry is evicted regardless of the configured
+  ``AxiomLoggerBufferPolicy``,
+- the worker is not woken,
+- the diagnostic callback receives
+  ``AxiomLoggerDiagnostic/admissionSequenceExhausted``.
+
+Every subsequent admission on the same logger instance fires
+the diagnostic again. The condition is a hard stop on that
+instance and does not propagate to other loggers or to the
+engine's durable-delivery lifecycle.
+
 ## Non-goals
 
-`swift-logger-axiom 0.1.0` deliberately ships no:
+`swift-logger-axiom 0.2.0` deliberately ships no:
 
-- best-effort in-memory `AxiomLogger` (durable-only M4.1 scope).
-- autonomous scheduler or timer.
+- autonomous scheduler or timer; ``AxiomLogger/flush()`` is
+  caller-driven.
 - platform lifecycle observer.
 - SDK / RUM integration (HTTP-only -- Axiom does not ship a
   first-party iOS SDK).
 - per-item parsing of Axiom's `failures` response array; whole-
-  batch 2xx -> success projection is the `0.1.0` contract.
+  batch 2xx -> success projection remains the transport contract.
 - query / search API.
 - direct mobile-safe token claims.
+- transport metadata on the `RemoteDeliveryEntry`; the `0.2.0`
+  encoder writes payload bytes only. Hosts that need routing hints
+  should encode them as ordinary JSON fields in the event document
+  or use an intake / proxy endpoint.
+- in-logger retry of encoder, identifier, or enqueue failures.
+  Diagnostics are surfaced; the entry is dropped.
