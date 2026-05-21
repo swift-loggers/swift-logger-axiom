@@ -66,4 +66,71 @@ extension Tag {
     /// Acknowledgement-to-removal lifecycle: ack only on pass-wide
     /// `.success` / `.terminal` resolution.
     @Tag public static var axm15: Self
+
+    // MARK: `AxiomLogger` admission and worker
+
+    /// `AxiomLogger(wiring:)` constructable with the default encoder
+    /// and default identifier provider; accepted entry is eventually
+    /// enqueued through `DurableRemoteQueue.enqueue(_:)` and
+    /// `flush()` invokes the engine flush closure.
+    @Tag public static var axm16: Self
+    /// `LoggerLevel.disabled` drop guard never evaluates message or
+    /// attributes autoclosures and fires no diagnostic callback.
+    @Tag public static var axm17: Self
+    /// Below-minimum drop guard never evaluates message or
+    /// attributes autoclosures and fires no diagnostic callback.
+    @Tag public static var axm18: Self
+    /// Accepted entry evaluates message and attributes exactly once.
+    @Tag public static var axm19: Self
+    /// `.dropNewest` drops the new entry without evaluating its
+    /// autoclosures and fires `bufferFull(dropped:)`.
+    @Tag public static var axm20: Self
+    /// `.dropOldest` drops the oldest pending entry without
+    /// evaluating it, admits the new entry, and fires
+    /// `bufferFull(dropped:)`.
+    @Tag public static var axm21: Self
+    /// Encoder failure surfaces `encodingFailed(String)`; the entry
+    /// is not enqueued.
+    @Tag public static var axm22: Self
+    /// Identifier failure surfaces `identifierFailed(String)`; the
+    /// entry is not enqueued.
+    @Tag public static var axm23: Self
+    /// Enqueue failure surfaces `enqueueFailed(String)`.
+    @Tag public static var axm24: Self
+    /// `flush()` drains every accepted pending entry before calling
+    /// the engine flush closure.
+    @Tag public static var axm25: Self
+    /// Per-caller serial ordering preserved in the worker's
+    /// enqueue order.
+    @Tag public static var axm26: Self
+    /// Concurrent admissions never produce duplicate identifiers.
+    @Tag public static var axm27: Self
+
+    // MARK: Default encoder
+
+    /// Default encoder emits the documented JSON field names
+    /// (`_time`, `level`, `domain`, `message`, `attributes`).
+    @Tag public static var axm28: Self
+    /// Default encoder renders private message segments as
+    /// `<private>` and sensitive segments as `<redacted>`.
+    @Tag public static var axm29: Self
+    /// Default encoder renders private attribute values as the
+    /// string `<private>` and sensitive values as `<redacted>`.
+    @Tag public static var axm30: Self
+    /// Duplicate attribute keys resolve last-wins in the encoded
+    /// `attributes` object.
+    @Tag public static var axm31: Self
+    /// Encoded event payload bytes are framed verbatim by the
+    /// existing Axiom request body helper.
+    @Tag public static var axm32: Self
+    /// Threshold uses the nested `AxiomLogger.MinimumLevel` enum
+    /// (seven severities); `LoggerLevel.disabled` is not
+    /// expressible as a threshold through the public API.
+    @Tag public static var axm33: Self
+    /// Admission-sequence exhaustion: `acceptedSequence` never
+    /// wraps past `UInt64.max`; further admissions are rejected
+    /// without evaluating closures or evicting pending entries
+    /// and surface
+    /// `AxiomLoggerDiagnostic.admissionSequenceExhausted`.
+    @Tag public static var axm34: Self
 }

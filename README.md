@@ -5,10 +5,11 @@ Axiom HTTP ingest adapter for
 [`swift-loggers/swift-logger-remote`](https://github.com/swift-loggers/swift-logger-remote).
 
 `swift-logger-axiom` is a concrete remote adapter on top of
-`swift-logger-remote 0.1.0`. The package is durable-only: it
-bridges Axiom HTTP ingest delivery onto the shared `RemoteEngine`
-+ `DurableRemoteQueue` lifecycle without shipping a best-effort
-in-memory logger of its own.
+`swift-logger-remote 0.1.0`. The package bridges Axiom HTTP ingest
+delivery onto the shared `RemoteEngine` + `DurableRemoteQueue`
+lifecycle and ships a batteries-included `Loggers.Logger` adapter
+(`AxiomLogger`) that admits log entries non-blockingly and routes
+them through that engine.
 
 `AxiomRemoteEngine` bridges ingest delivery onto
 `swift-logger-remote`'s durable engine: a persistence-backed
@@ -27,7 +28,7 @@ item in the batch round. The host wires `flush()` from its own
 lifecycle hooks (background notifications, shutdown signals,
 periodic tasks).
 
-> **`0.1.0` public API surface (final, locked):**
+> **`0.2.0` public API surface:**
 >
 > - `AxiomRemoteEngine.make(_:)` -- the durable path. Returns a
 >   `Wiring` carrying `DurableRemoteQueue` and `RemoteEngine`.
@@ -37,6 +38,12 @@ periodic tasks).
 > - `AxiomEndpoint`: direct Axiom ingest with an Axiom API token,
 >   or a consumer-owned intake / proxy / gateway endpoint with an
 >   arbitrary `Authorization` header (or none).
+> - `AxiomLogger`: `Loggers.Logger` adapter with bounded admission
+>   buffer, a single internal serial worker, a pluggable
+>   `AxiomLogEventEncoder`, a pluggable `AxiomIdentifierProvider`,
+>   buffer-policy and minimum-level controls, and an
+>   `onDiagnostic` callback. `flush()` drains accepted pending
+>   entries and runs the engine flush pass.
 
 Requires Swift 6.0+. iOS 13.4, macOS 10.15.4, tvOS 13.4,
 watchOS 6.2, visionOS 1. MIT licensed.
@@ -114,10 +121,11 @@ Add this package, the core
 [`swift-loggers/swift-logger`](https://github.com/swift-loggers/swift-logger)
 package (`LoggerLibrary`), and
 [`swift-loggers/swift-logger-remote`](https://github.com/swift-loggers/swift-logger-remote)
-to your `Package.swift`. All three release-lock to `0.1.0` through
-SwiftPM's `.upToNextMinor(from: "0.1.0")` requirement. The `LoggerLibrary`
-product re-exports the core abstractions and the companion adapters
-and is the recommended import for consumer code.
+to your `Package.swift`. `swift-logger-axiom` release-locks to
+`0.2.0`; the core and remote packages release-lock to `0.1.0`. The
+`LoggerLibrary` product re-exports the core abstractions and the
+companion adapters and is the recommended import for consumer
+code.
 
 ```swift
 // In your Package.swift:
@@ -126,7 +134,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/swift-loggers/swift-logger-axiom.git",
-            .upToNextMinor(from: "0.1.0")
+            .upToNextMinor(from: "0.2.0")
         ),
         .package(
             url: "https://github.com/swift-loggers/swift-logger.git",
@@ -268,13 +276,138 @@ controls the underlying network round-trip; it does not influence
 retry, batching, or acknowledgement, which stay owned by
 `swift-logger-remote`'s engine.
 
+## `AxiomLogger`
+
+`AxiomLogger` is a batteries-included `Loggers.Logger` adapter that
+wraps an `AxiomRemoteEngine.Wiring` with a bounded admission
+buffer, a single internal serial worker, a default JSON event
+encoder, and a default monotonic identifier provider. Call sites
+log structured entries through the standard `Loggers.Logger`
+contract; the worker materializes each accepted entry, encodes it,
+and enqueues it onto the durable queue.
+
+```swift
+import Foundation
+import LoggerRemote
+import Loggers
+import LoggerAxiom
+
+let queueDirectory = URL(fileURLWithPath: "/tmp/swift-logger-axiom/queue")
+let exportDirectory = URL(fileURLWithPath: "/tmp/swift-logger-axiom/exports")
+
+let wiring = AxiomRemoteEngine.make(
+    AxiomRemoteEngine.Configuration(
+        endpoint: .intake(
+            url: URL(string: "https://logs.example.com/axiom")!,
+            authorizationHeader: "Bearer demo-app-token"
+        ),
+        queueDirectory: queueDirectory,
+        exportDirectory: exportDirectory,
+        batchPolicy: try RemoteBatchPolicy.make(
+            maxEntryCount: 100, maxByteCount: 64 * 1024
+        ),
+        retryPolicy: try RemoteRetryPolicy.make(
+            maxAttempts: 3,
+            backoff: .exponential(
+                initialSeconds: 0.5, multiplier: 2, capSeconds: 8
+            )
+        )
+    )
+)
+
+let logger = AxiomLogger(
+    wiring: wiring,
+    bufferPolicy: .dropOldest(capacity: 2_000),
+    minimumLevel: .info,
+    onDiagnostic: { diagnostic in
+        // Surface admission drops, encoding failures, identifier
+        // failures, and queue enqueue failures to your own
+        // observability stack.
+        print("axiom diagnostic: \(diagnostic)")
+    }
+)
+
+let network: LoggerDomain = "Network"
+logger.info(network, "Request finished", attributes: [
+    LogAttribute("status", 200),
+    LogAttribute("path", "/api/items"),
+    LogAttribute("user_id", "alice", privacy: .private)
+])
+let summary = try await logger.flush()
+```
+
+**Admission.** `log(_:_:_:attributes:)` is synchronous and
+non-blocking with respect to the durable queue. The drop guard for
+`LoggerLevel.disabled` and below-minimum entries runs at the call
+site **before** the `message` or `attributes` autoclosures are
+evaluated, so dropped entries never pay the cost of building their
+payload. When the bounded buffer is full,
+`.dropNewest(capacity:)` rejects the new entry without evaluating
+its closures and `.dropOldest(capacity:)` evicts the oldest
+pending entry (also without evaluating it) and admits the new
+entry. Buffer drops fire `AxiomLoggerDiagnostic.bufferFull(dropped:)`.
+
+**Worker.** A single internal serial worker materializes each
+accepted entry, evaluates its `message` and `attributes`
+autoclosures exactly once, calls the configured
+`AxiomLogEventEncoder`, allocates an identifier through the
+configured `AxiomIdentifierProvider`, and enqueues the payload
+bytes onto the durable queue. Encoder, identifier, and queue
+enqueue failures surface as `encodingFailed`, `identifierFailed`,
+and `enqueueFailed` diagnostics; the logger does not locally retry the
+entry. The worker is implementation-private and not actor-isolated
+API surface.
+
+**Flush.** An accepted pending entry is a log entry successfully
+admitted into `AxiomLogger`'s internal buffer. `AxiomLogger.flush()`
+returns to the caller only after every entry already admitted at the
+moment of the call has either been enqueued or surfaced a diagnostic
+failure, and then runs the engine flush pass. Entries dropped at
+admission and entries admitted after `flush()` was invoked are not
+part of the barrier.
+
+### Default JSON event schema
+
+`AxiomDefaultLogEventEncoder` emits one JSON object per event:
+
+```json
+{
+  "_time": "2026-05-20T12:34:56.789Z",
+  "level": "info",
+  "domain": "Network",
+  "message": "Request finished",
+  "attributes": {
+    "status": 200,
+    "path": "/api/items",
+    "user_id": "<private>"
+  }
+}
+```
+
+`_time` is an RFC 3339 wall-clock string with fractional-second
+precision (`yyyy-MM-ddTHH:mm:ss.SSSZ`), always in UTC. Private
+message segments and attribute values render as the literal string
+`<private>`; sensitive ones render as `<redacted>`. Duplicate
+attribute keys resolve last-wins. Non-finite `Double` attribute
+values render through the stable string fallback
+(`String(describing: value)`). The default encoder never throws for
+representable logger events; unsupported attribute values are encoded
+through the stable fallback path.
+
+Consumers that need a custom Axiom dataset schema can supply their
+own `AxiomLogEventEncoder`; consumers that need persistent
+deduplication identity across app launches can supply their own
+`AxiomIdentifierProvider`. `AxiomMonotonicIdentifierProvider` is
+process-local and does not guarantee stable IDs across app restarts.
+
 ## Response model
 
 Axiom's ingest endpoint returns a **whole-request** status code
 and a single `{"ingested": N, "failed": M, "failures": [...]}`-
-shaped envelope. `swift-logger-axiom 0.1.0` does **not**
-semantically parse or validate the response body for per-item
-classification, so:
+shaped envelope. The adapter performs transport-level
+success/failure classification only and treats the response body as
+opaque payload bytes. It does **not** semantically parse or validate
+the response body for per-item classification, so:
 
 - A 2xx Axiom reply resolves every active item in the batch round
   to `.success` with the opaque response bytes Axiom returned.
@@ -289,22 +422,28 @@ classification, so:
 
 ## Non-goals
 
-`swift-logger-axiom 0.1.0` deliberately ships no:
+`swift-logger-axiom 0.2.0` deliberately ships no:
 
-- best-effort in-memory `AxiomLogger`; the package intentionally
-  focuses on the durable remote path only.
-- autonomous scheduler (`flush()` is caller-driven).
-- platform lifecycle observer (host code wires `flush()` from
-  whatever lifecycle hooks it cares about).
-- SDK / RUM integration (`swift-logger-axiom` is HTTP-only; Axiom
-  does not ship a first-party iOS SDK).
-- per-item parsing of Axiom's `failures` response array; whole-
-  batch 2xx -> success projection is the `0.1.0` contract.
-- query / search API (this package writes events; reading is out
-  of scope).
-- direct mobile-safe token claims (the Axiom API token is
+- autonomous scheduler. `RemoteEngine.flush()` and
+  `AxiomLogger.flush()` are caller-driven; host code wires both
+  from whatever lifecycle hooks it cares about.
+- platform lifecycle observer.
+- SDK / RUM integration. `swift-logger-axiom` is HTTP-only; Axiom
+  does not ship a first-party iOS SDK.
+- per-item parsing of Axiom's `failures` response array. The
+  whole-batch 2xx -> success projection remains the transport
+  contract.
+- query / search API. This package writes events; reading is out
+  of scope.
+- direct mobile-safe token claims. The Axiom API token is
   extractable from any client binary that holds it; use
-  `.intake(...)` for hardened production deployments).
+  `.intake(...)` for hardened production deployments.
+- transport metadata on the `RemoteDeliveryEntry` payload. The
+  `0.2.0` default encoder writes payload bytes only. Hosts that need
+  routing hints should encode them as ordinary JSON fields in the
+  event document or use an intake / proxy endpoint.
+- in-logger retry of encoder, identifier, or enqueue failures.
+  Diagnostics are surfaced; the entry is dropped.
 
 ## License
 
