@@ -92,6 +92,30 @@ public enum AxiomLoggerDiagnostic: Sendable, Equatable {
     case enqueueFailed(String)
     case admissionSequenceExhausted
 }
+
+public enum AxiomFlushPolicy: Sendable, Equatable {
+    case manual
+    case periodic(seconds: TimeInterval)
+}
+
+public enum AxiomLoggingServiceDiagnostic: Sendable, Equatable {
+    case flushFailed(String)
+    case invalidFlushInterval(seconds: TimeInterval)
+}
+
+public final class AxiomLoggingService: Sendable {
+    public init(
+        logger: AxiomLogger,
+        flushPolicy: AxiomFlushPolicy = .periodic(seconds: 30),
+        onDiagnostic: (@Sendable (AxiomLoggingServiceDiagnostic) -> Void)? = nil
+    )
+
+    public func start()
+    public func stop() async
+
+    @discardableResult
+    public func flush() async throws -> RemoteFlushSummary
+}
 ```
 
 The package exposes **nothing else** as `public`. The internal
@@ -205,6 +229,74 @@ The callback must satisfy the `@Sendable` contract in both cases.
 String payloads use `String(describing: error)`, not
 `localizedDescription`, so the diagnostic carries a stable spelling
 regardless of the upstream error's `LocalizedError` conformance.
+
+## `AxiomLoggingService`
+
+``AxiomLoggingService`` is an optional convenience over explicit
+``AxiomLogger/flush()``. It owns scheduling; the logger stays
+deterministic. The service declares no UIKit / AppKit / SwiftUI /
+WatchKit dependency and subscribes to no process-lifecycle
+notification on its own — integration with platform lifecycle hooks
+(background notifications, shutdown signals) remains the caller's
+responsibility.
+
+### Flush policy
+
+``AxiomFlushPolicy/manual`` runs no internal periodic loop. The
+service only drives flushes the host requests explicitly through
+``AxiomLoggingService/flush()`` plus the single final flush
+performed inside ``AxiomLoggingService/stop()``.
+
+``AxiomFlushPolicy/periodic(seconds:)`` launches one internal task
+on ``AxiomLoggingService/start()``. Each iteration sleeps for the
+configured interval and then awaits one ``AxiomLogger/flush()`` to
+completion before sleeping again. Two periodic flushes on the same
+service instance never overlap. A non-positive, non-finite, or
+sub-nanosecond positive interval (any value that truncates to
+zero nanoseconds) is rejected at ``AxiomLoggingService/start()``
+time: the service starts no periodic loop, surfaces
+``AxiomLoggingServiceDiagnostic/invalidFlushInterval(seconds:)``
+through the `onDiagnostic` callback, and behaves as
+``AxiomFlushPolicy/manual`` thereafter.
+
+### Lifecycle
+
+``AxiomLoggingService/start()`` is idempotent. Repeated calls do
+not launch additional periodic loops, and a call after
+``AxiomLoggingService/stop()`` is a no-op.
+
+``AxiomLoggingService/stop()`` cancels the periodic loop, awaits
+its exit, and performs exactly one final ``AxiomLogger/flush()``
+before returning. A throw from that final flush surfaces through
+the `onDiagnostic` callback as
+``AxiomLoggingServiceDiagnostic/flushFailed(_:)`` instead of
+re-throwing from ``AxiomLoggingService/stop()``. Subsequent
+``AxiomLoggingService/stop()`` calls return immediately and do not
+re-run the final flush.
+
+``AxiomLoggingService/flush()`` forwards directly to
+``AxiomLogger/flush()`` and returns the resulting
+`RemoteFlushSummary`. A throw is re-thrown to the caller verbatim;
+the diagnostic callback is not invoked for explicit-flush failures.
+
+### Service diagnostics
+
+The optional `onDiagnostic` callback receives
+``AxiomLoggingServiceDiagnostic`` values for two failure modes:
+
+- ``AxiomLoggingServiceDiagnostic/flushFailed(_:)`` fires when the
+  periodic loop or the final flush inside
+  ``AxiomLoggingService/stop()`` throws. The callback runs on the
+  internal task context. The string payload uses
+  `String(describing: error)`, identical to the
+  ``AxiomLoggerDiagnostic`` convention.
+- ``AxiomLoggingServiceDiagnostic/invalidFlushInterval(seconds:)``
+  fires synchronously on the caller's ``AxiomLoggingService/start()``
+  thread when ``AxiomFlushPolicy/periodic(seconds:)`` carries a
+  non-positive, non-finite, or sub-nanosecond positive interval
+  (any value that truncates to zero nanoseconds).
+
+The callback must satisfy the `@Sendable` contract in both cases.
 
 ## Default JSON event schema
 
@@ -408,10 +500,15 @@ documented ingest error model:
   until the engine acknowledges a fully-resolved non-empty flush
   pass).
 
-The adapter never re-implements those concerns. The engine is
-caller-driven: it owns no timer, no platform lifecycle observer,
-no autonomous scheduler. Hosts wire `flush()` calls from their
-own lifecycle hooks or scheduling infrastructure.
+The adapter never re-implements those concerns. The engine and
+``AxiomLogger`` are caller-driven: neither owns a timer, a
+platform lifecycle observer, or an autonomous scheduler. Hosts
+wire `flush()` from their own lifecycle hooks, scheduling
+infrastructure, or the optional ``AxiomLoggingService``
+periodic-flush coordinator (`AXM-35..45`); the service runs a
+timer only when the host opts into
+``AxiomFlushPolicy/periodic(seconds:)`` and calls
+``AxiomLoggingService/start()``.
 
 ## Why retry / ACK / persistence stay in `swift-logger-remote`
 
